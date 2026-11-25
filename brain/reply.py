@@ -25,6 +25,13 @@ from typing import Any
 
 import httpx
 
+try:
+    # The Anthropic SDK bundles its own HTTP stack (httpx2), so its failures are NOT httpx
+    # exceptions and would otherwise escape reply()'s handlers and kill the whole voice turn.
+    from anthropic import APIStatusError, AnthropicError
+except ImportError:  # anthropic is optional; an empty tuple simply never matches
+    APIStatusError = AnthropicError = ()  # type: ignore[assignment,misc]
+
 from memory import Memory
 
 log = logging.getLogger("brain.reply")
@@ -37,6 +44,21 @@ HISTORY_TO_LLM = int(os.environ.get("BOOGEYMAN_HISTORY", "12"))  # messages of r
 # Groq's free tier limits each model separately (per minute and per day). When one is used up,
 # he moves on to the next instead of going quiet.
 GROQ_FALLBACKS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+
+
+# On a slow or distant link the TLS handshake is the thing that times out, and httpx drops idle
+# pooled connections after 5s by default, so every voice turn pays for a fresh one. Keep the
+# connection warm between turns, allow a generous handshake, and retry connect failures.
+CONNECT_TIMEOUT = float(os.environ.get("BOOGEYMAN_CONNECT_TIMEOUT", "30"))
+KEEPALIVE_S = float(os.environ.get("BOOGEYMAN_KEEPALIVE", "300"))
+CONNECT_RETRIES = int(os.environ.get("BOOGEYMAN_CONNECT_RETRIES", "2"))
+
+
+def _transport() -> httpx.AsyncHTTPTransport:
+    return httpx.AsyncHTTPTransport(
+        retries=CONNECT_RETRIES,
+        limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=KEEPALIVE_S),
+    )
 
 
 class AllLimited(Exception):
@@ -95,7 +117,7 @@ class Replier:
         self.on_memory = on_memory
         # Extra tools registered by the app: name -> (schema, async handler(args) -> result str)
         self.extra: dict[str, tuple[dict[str, Any], Callable[[dict[str, Any]], Awaitable[str]]]] = {}
-        self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=10.0))
+        self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=CONNECT_TIMEOUT), transport=_transport())
         self._cooldown: dict[str, float] = {}  # model -> monotonic time it can be used again
         self.provider = resolve_provider(provider, anthropic_key, groq_key, openai_key)
         self.model = model or DEFAULT_MODEL.get(self.provider, "")
@@ -105,7 +127,8 @@ class Replier:
         if self.provider == "anthropic":
             from anthropic import AsyncAnthropic
 
-            self.anthropic = AsyncAnthropic(api_key=anthropic_key)
+            # The SDK keeps its own pool and retry budget; give it the same patience.
+            self.anthropic = AsyncAnthropic(api_key=anthropic_key, timeout=60.0, max_retries=CONNECT_RETRIES + 1)
 
     @property
     def online(self) -> bool:
@@ -185,6 +208,17 @@ class Replier:
             if code == 429:
                 return "I've hit my free limit for now, boss. Give me a minute."
             return f"My brain returned an error, {code}. Try again in a moment."
+        except APIStatusError as e:  # Anthropic answered, but with an error status
+            code = e.status_code
+            log.warning("anthropic error %s: %s", code, str(e)[:300])
+            if code in (401, 403):
+                return f"My {self.provider} key was rejected, boss. Check it in the brain's env file."
+            if code == 429:
+                return "I've hit my rate limit for now, boss. Give me a minute."
+            return f"My brain returned an error, {code}. Try again in a moment."
+        except AnthropicError as e:  # couldn't reach Anthropic at all (connect/read/timeout)
+            log.warning("anthropic unreachable: %s", e)
+            return "I can't reach my brain right now, boss. Check the internet."
         except httpx.HTTPError as e:
             log.warning("%s unreachable: %s", self.provider, e)
             return "I can't reach my brain right now, boss. Check the internet."

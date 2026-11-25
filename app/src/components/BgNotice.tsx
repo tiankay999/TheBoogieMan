@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { hud } from '../hud/store'
+import { IS_LINUX } from '../three/VideoBackground'
 
 /** Says so on screen when a background video can't play on this machine. */
 export default function BgNotice() {
@@ -18,8 +19,16 @@ export default function BgNotice() {
     <div className="bg-notice">
       <b>{missing.toUpperCase()} VIDEO WON'T PLAY HERE</b>
       <span>
-        Run <code>sudo apt install gstreamer1.0-plugins-good gstreamer1.0-libav</code> and restart. Details are in the terminal (lines starting with{' '}
-        <code>[bg]</code>).
+        {IS_LINUX ? (
+          <>
+            Run <code>sudo apt install gstreamer1.0-plugins-good gstreamer1.0-libav</code> and restart. Details are in the terminal (lines starting with{' '}
+            <code>[bg]</code>).
+          </>
+        ) : (
+          <>
+            This machine&apos;s webview can&apos;t decode that clip. Details are in the terminal (lines starting with <code>[bg]</code>).
+          </>
+        )}
       </span>
     </div>
   )

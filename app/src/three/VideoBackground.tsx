@@ -116,6 +116,7 @@ export default function VideoBackground({ devil }: { devil: React.RefObject<numb
     load(backgroundByName(hud.bgName))
     return () => {
       video.onerror = null
+      video.onended = null
       video.pause()
       video.removeAttribute('src')
       video.load()
@@ -155,11 +156,27 @@ export default function VideoBackground({ devil }: { devil: React.RefObject<numb
         w8.t = video.currentTime
         w8.at = now
       } else if (now - w8.at > STALL_MS) {
-        bgLog(
-          `${video.currentSrc.split('/').pop() || '?'} stuck (readyState ${video.readyState}, network ${video.networkState}, t=${video.currentTime.toFixed(2)}) — trying the next file`,
-        )
         w8.at = now
-        nextRef.current()
+        // A clip frozen on its last frame is a loop that didn't restart, not a source that can't
+        // play. WebView2 does this routinely. Rewind it instead of throwing the file away.
+        const dur = video.duration
+        if (w8.ok && Number.isFinite(dur) && dur > 0 && video.currentTime >= dur - 0.5) {
+          bgLog(`${current.current} stalled at the loop point (t=${video.currentTime.toFixed(2)}/${dur.toFixed(2)}) — rewinding`)
+          // Seeking can throw if the element isn't seekable; never let one bad frame escape
+          // this callback, because an error here would tear down the whole UI.
+          try {
+            video.currentTime = 0
+            video.play().catch(() => {})
+          } catch (err) {
+            bgLog(`rewind failed (${err}) — trying the next file`)
+            nextRef.current()
+          }
+        } else {
+          bgLog(
+            `${video.currentSrc.split('/').pop() || '?'} stuck (readyState ${video.readyState}, network ${video.networkState}, t=${video.currentTime.toFixed(2)}) — trying the next file`,
+          )
+          nextRef.current()
+        }
       }
     }
     const bg = backgroundByName(current.current)

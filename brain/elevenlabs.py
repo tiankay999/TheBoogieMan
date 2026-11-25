@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from reply import CONNECT_RETRIES, CONNECT_TIMEOUT, KEEPALIVE_S
+
 API = "https://api.elevenlabs.io"
 TTS_RATE = 24000  # Hz, matches output_format below
 TTS_FORMAT = f"pcm_{TTS_RATE}"  # raw 16-bit little-endian mono
@@ -16,7 +18,16 @@ class ElevenLabs:
         self.voice_id = voice_id
         self.tts_model = tts_model
         self.stt_model = stt_model
-        self.http = client or httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+        # Speech in and out happen once per turn, often with long gaps. httpx drops idle pooled
+        # connections after 5s, so without this every turn pays for a fresh TLS handshake, and on
+        # a slow link that handshake is exactly what times out. Keep it warm and retry connects.
+        self.http = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=CONNECT_TIMEOUT),
+            transport=httpx.AsyncHTTPTransport(
+                retries=CONNECT_RETRIES,
+                limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=KEEPALIVE_S),
+            ),
+        )
         self.headers = {"xi-api-key": api_key}
 
     async def transcribe(self, wav: bytes) -> str:
