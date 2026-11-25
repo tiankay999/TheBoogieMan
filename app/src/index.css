@@ -479,3 +479,49 @@ kbd { font-family: var(--mono); border: 1px solid var(--line-strong); border-rad
   color: #ff4a1c; background: transparent; border: 1px solid #ff4a1c; cursor: pointer;
 }
 .crash button:hover { background: #ff4a1c; color: #000; }
+
+/* ── Devil mode: the room itself should feel wrong ──────────────────────────
+   Pure CSS over the canvas, so none of it can throw into the render loop. */
+
+/* A slow heartbeat. Everything below hangs off this one rhythm. */
+@keyframes devil-pulse {
+  0%, 100% { opacity: 0.30; }
+  42%      { opacity: 0.30; }
+  48%      { opacity: 0.72; }   /* thump */
+  54%      { opacity: 0.38; }
+  60%      { opacity: 0.62; }   /* thump-thump */
+  68%      { opacity: 0.30; }
+}
+@keyframes devil-breathe {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.012); }
+}
+@keyframes devil-scan { from { transform: translateY(0); } to { transform: translateY(5px); } }
+
+/* Blood glow creeping in from the edges, beating like a pulse. */
+.mode-devil::before {
+  content: ''; position: fixed; inset: 0; z-index: 40; pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 42%, rgba(120, 0, 10, 0.5) 86%, rgba(190, 0, 16, 0.78) 100%);
+  animation: devil-pulse 2.6s ease-in-out infinite;
+  mix-blend-mode: screen;
+}
+
+/* Scanlines: CRT grain over everything, drifting slowly downward. */
+.mode-devil::after {
+  content: ''; position: fixed; inset: -5px; z-index: 41; pointer-events: none; opacity: 0.5;
+  background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, 0.34) 0 1px, transparent 1px 3px);
+  animation: devil-scan 0.9s linear infinite;
+}
+
+/* The whole HUD breathes with the heartbeat and runs hot. */
+.mode-devil .hud { animation: devil-breathe 2.6s ease-in-out infinite; }
+.mode-devil .captions,
+.mode-devil .keyhint { text-shadow: 0 0 10px rgba(255, 20, 40, 0.75); }
+.mode-devil .keyhint kbd { border-color: rgba(255, 40, 60, 0.6); color: #ff6a6a; }
+
+/* Respect the system setting: the pulse is strong, and some people can't take it. */
+@media (prefers-reduced-motion: reduce) {
+  .mode-devil::before { animation: none; opacity: 0.45; }
+  .mode-devil::after { animation: none; }
+  .mode-devil .hud { animation: none; }
+}

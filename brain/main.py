@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import config
+import hands
 from commands import Commands
 from memory import Memory
 from reply import Replier
@@ -79,7 +80,17 @@ replier = Replier(
     on_memory=push_memory,
 )
 commands = Commands()
-state: dict[str, Any] = {"greeted": False, "capabilities": {}, "action": None}
+state: dict[str, Any] = {"greeted": False, "capabilities": {}, "action": None, "devil": False, "tts": None}
+
+
+async def set_devil(on: bool) -> None:
+    """Devil mode is not just a colour scheme: it changes how he thinks and how he sounds."""
+    state["devil"] = on
+    replier.devil = on  # colder, shorter persona (brain/devil.md); same limits
+    if state["tts"] is not None:
+        state["tts"].devil = on  # slower, less stable voice
+    await hub.emit("ui.devil", {"on": on})
+    log.info("devil mode %s", "on" if on else "off")
 
 
 RESEARCH_CMD = re.compile(r"^(?:please\s+)?(?:research|look\s+up|search\s+(?:for|the\s+web\s+for)|find\s+out\s+(?:about)?|google)\s+(.+)", re.I)
@@ -91,7 +102,7 @@ async def ui_action(action: str | None) -> str | None:
         await hub.emit("ui.mode", {"mode": action})
         return None
     if action and action.startswith("devil:"):
-        await hub.emit("ui.devil", {"on": action == "devil:on"})
+        await set_devil(action == "devil:on")
         return None
     if action == "help":
         await hub.emit("ui.help", {"show": True})
@@ -147,8 +158,12 @@ async def tool_switch_screen(args: dict[str, Any]) -> str:
 
 async def tool_devil_mode(args: dict[str, Any]) -> str:
     on = bool(args.get("on", True))
-    await hub.emit("ui.devil", {"on": on})
-    return "Devil mode is on: visor down, red, the eye is open." if on else "Devil mode is off."
+    await set_devil(on)
+    return (
+        "Devil mode is on: visor down, red, the eye is open. Answer from here on exactly as devil mode tells you to."
+        if on
+        else "Devil mode is off. Back to your normal voice."
+    )
 
 
 async def tool_set_background(args: dict[str, Any]) -> str:
@@ -168,6 +183,47 @@ async def tool_clear_conversation(args: dict[str, Any]) -> str:
     memory.clear_history()
     await push_memory()
     return "Recent conversation cleared (long-term facts kept)."
+
+
+async def _hands(fn, *a: Any) -> str:
+    """Run a blocking hands call off the event loop, turning refusals into plain speech."""
+    try:
+        return await asyncio.to_thread(fn, *a)
+    except hands.Unsafe as e:
+        return f"Refused: {e}"
+
+
+async def tool_open_app(args: dict[str, Any]) -> str:
+    return await _hands(hands.open_app, str(args.get("app", "")))
+
+
+async def tool_close_app(args: dict[str, Any]) -> str:
+    return await _hands(hands.close_app, str(args.get("app", "")))
+
+
+async def tool_list_files(args: dict[str, Any]) -> str:
+    return await _hands(hands.list_files, str(args.get("folder", "")))
+
+
+async def tool_create_file(args: dict[str, Any]) -> str:
+    return await _hands(
+        hands.create_file, str(args.get("name", "")), str(args.get("content", "")), bool(args.get("overwrite", False))
+    )
+
+
+async def tool_delete_file(args: dict[str, Any]) -> str:
+    return await _hands(hands.delete_file, str(args.get("name", "")), bool(args.get("confirmed", False)))
+
+
+async def tool_type_text(args: dict[str, Any]) -> str:
+    return await _hands(
+        hands.type_text, str(args.get("text", "")), bool(args.get("confirmed", False)), bool(args.get("press_enter", False))
+    )
+
+
+async def tool_focused_window(args: dict[str, Any]) -> str:
+    where = await asyncio.to_thread(hands.focused_window)
+    return f"The focused window is {where!r}." if where else "I can't tell which window is focused."
 
 
 async def tool_research(args: dict[str, Any]) -> str:
@@ -248,6 +304,113 @@ replier.add_tool(
 )
 replier.add_tool(
     {
+        "name": "open_app",
+        "description": "Open an application, or a file in his workspace. You CAN do this. "
+        "Use it for 'open the browser', 'launch spotify', 'start notepad', 'open my notes'. "
+        "Give the app the way he said it; common names are mapped for you.",
+        "parameters": {
+            "type": "object",
+            "properties": {"app": {"type": "string", "description": "App or file name, in plain words."}},
+            "required": ["app"],
+        },
+    },
+    tool_open_app,
+)
+replier.add_tool(
+    {
+        "name": "close_app",
+        "description": "Close a running application. You CAN do this. Use it for 'close spotify', "
+        "'quit the browser', 'shut chrome down'. It refuses system-critical processes. "
+        "To close YOURSELF, use the shutdown tool instead, never this one.",
+        "parameters": {
+            "type": "object",
+            "properties": {"app": {"type": "string", "description": "App name, in plain words."}},
+            "required": ["app"],
+        },
+    },
+    tool_close_app,
+)
+replier.add_tool(
+    {
+        "name": "list_files",
+        "description": "List what's in the boss's workspace folder. Use it before deleting anything, "
+        "and whenever he asks what files he has or what's in a folder.",
+        "parameters": {
+            "type": "object",
+            "properties": {"folder": {"type": "string", "description": "Sub-folder, or empty for the workspace root."}},
+            "required": [],
+        },
+    },
+    tool_list_files,
+)
+replier.add_tool(
+    {
+        "name": "create_file",
+        "description": "Write a text file into the boss's workspace folder. You CAN do this. "
+        "Use it for 'save that as a file', 'write me a note', 'put that in a text file'. "
+        "Only set overwrite=true after he has agreed to replace an existing file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "File name, e.g. 'notes/ideas.txt'."},
+                "content": {"type": "string", "description": "What goes in the file."},
+                "overwrite": {"type": "boolean", "description": "Replace an existing file (ask him first)."},
+            },
+            "required": ["name", "content"],
+        },
+    },
+    tool_create_file,
+)
+replier.add_tool(
+    {
+        "name": "delete_file",
+        "description": "Delete a file from the boss's workspace, into a trash folder so it can come back. "
+        "ALWAYS call it first with confirmed=false: that arms it and gives you the exact question to ask him. "
+        "Only call again with confirmed=true after he has actually said yes out loud. Never guess a file name: "
+        "use list_files if you aren't certain what he means.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "File name as it appears in the workspace."},
+                "confirmed": {"type": "boolean", "description": "true only after he said yes to the question."},
+            },
+            "required": ["name", "confirmed"],
+        },
+    },
+    tool_delete_file,
+)
+replier.add_tool(
+    {
+        "name": "focused_window",
+        "description": "Name the window that currently has focus, i.e. where typing would land. "
+        "Use it when he asks what's open or in front, and before typing if you're unsure.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    tool_focused_window,
+)
+replier.add_tool(
+    {
+        "name": "type_text",
+        "description": "Type text on the keyboard into whatever window the boss has focused: his browser, "
+        "a search box, a document, a chat. You CAN do this. Use it for 'type this in my browser', "
+        "'search for X', 'write that in the box'. "
+        "ALWAYS call it first with confirmed=false: that tells you which window is focused and gives you "
+        "the exact question to ask. Only call again with confirmed=true after he has actually said go ahead. "
+        "Set press_enter=true only if he wants it sent or searched.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Exactly what to type."},
+                "confirmed": {"type": "boolean", "description": "true only after he said go ahead."},
+                "press_enter": {"type": "boolean", "description": "Press Enter afterwards (sends/searches)."},
+            },
+            "required": ["text", "confirmed"],
+        },
+    },
+    tool_type_text,
+)
+replier.add_tool(
+    {
         "name": "research",
         "description": "Search the web and read sources to answer something current or factual "
         "(news, prices, events, people, anything to look up). Shows the work live on the boss's screen. "
@@ -288,7 +451,15 @@ def setup_voice() -> dict[str, Any]:
     if settings.elevenlabs_key:
         from elevenlabs import TTS_RATE, ElevenLabs
 
-        el = ElevenLabs(settings.elevenlabs_key, settings.voice_id, settings.tts_model, settings.stt_model)
+        el = ElevenLabs(
+            settings.elevenlabs_key,
+            settings.voice_id,
+            settings.tts_model,
+            settings.stt_model,
+            devil_voice_id=settings.devil_voice_id,
+        )
+        el.devil = state["devil"]
+        state["tts"] = el  # so set_devil() can darken the voice
         voice.transcribe = el.transcribe
         voice.tts = el.speak
         caps["elevenlabs"] = True

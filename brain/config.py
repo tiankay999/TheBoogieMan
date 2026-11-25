@@ -23,6 +23,7 @@ class Settings:
     model: str | None
     elevenlabs_key: str | None
     voice_id: str
+    devil_voice_id: str | None
     tts_model: str
     stt_model: str
     mic_device: str | None
@@ -41,6 +42,8 @@ def load() -> Settings:
         elevenlabs_key=os.environ.get("ELEVENLABS_API_KEY") or None,
         # Brian: deep, resonant premade voice. Swap for any voice id in your ElevenLabs account.
         voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "nPczCjzI2devNBz1zQrb"),
+        # Optional second voice used only in devil mode. Unset = the same voice, darkened.
+        devil_voice_id=os.environ.get("ELEVENLABS_DEVIL_VOICE_ID") or None,
         tts_model=os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5"),
         stt_model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v2"),
         mic_device=os.environ.get("BOOGEYMAN_MIC") or None,

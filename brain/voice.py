@@ -232,6 +232,12 @@ class VoiceLoop:
                     break
             if len(buf) >= 2 and not self.interrupt.is_set():
                 await self.play_block(np.frombuffer(buf[: len(buf) - len(buf) % 2], dtype=np.int16))
+        except Exception as e:
+            # Losing his voice shouldn't look like a crash. Say why, on screen and in the log,
+            # and keep listening: the reply itself was already sent to the UI as text.
+            detail = tts_failure(e)
+            log.warning("text-to-speech failed: %s", detail)
+            await self.state("error", detail=detail)
         finally:
             self.speaking = False
             await self.emit("voice.level", {"source": "voice", "level": 0.0})
@@ -252,6 +258,20 @@ class VoiceLoop:
             self.mic.drain()
         if not self.busy.locked():
             await self.state("muted" if muted else "listening")
+
+
+def tts_failure(e: Exception) -> str:
+    """Turn a text-to-speech exception into something worth putting on screen."""
+    s = str(e)
+    if "quota_exceeded" in s or "credits remaining" in s:
+        return "ElevenLabs credits used up: no voice until the quota resets"
+    if "missing_permissions" in s:
+        return "the ElevenLabs key is missing the text_to_speech permission"
+    if "401" in s or "403" in s:
+        return "ElevenLabs rejected the key"
+    if "Timeout" in type(e).__name__ or "Connect" in type(e).__name__:
+        return "couldn't reach ElevenLabs: check the internet"
+    return f"{type(e).__name__}: {s[:120]}"
 
 
 def rest_of(text: str, seconds: float) -> str | None:

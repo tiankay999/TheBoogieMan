@@ -12,10 +12,25 @@ API = "https://api.elevenlabs.io"
 TTS_RATE = 24000  # Hz, matches output_format below
 TTS_FORMAT = f"pcm_{TTS_RATE}"  # raw 16-bit little-endian mono
 
+# Devil mode: slower and less stable, so the delivery drags and swings instead of staying even.
+# Low stability is what gives it menace; speed below 1.0 is what makes it feel deliberate.
+DEVIL_VOICE = {"stability": 0.28, "similarity_boost": 0.85, "style": 0.65, "speed": 0.82}
+
 
 class ElevenLabs:
-    def __init__(self, api_key: str, voice_id: str, tts_model: str, stt_model: str, client: httpx.AsyncClient | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        voice_id: str,
+        tts_model: str,
+        stt_model: str,
+        client: httpx.AsyncClient | None = None,
+        devil_voice_id: str | None = None,
+    ):
         self.voice_id = voice_id
+        # A separate voice for devil mode if one is configured, otherwise the same voice, darkened.
+        self.devil_voice_id = devil_voice_id or voice_id
+        self.devil = False
         self.tts_model = tts_model
         self.stt_model = stt_model
         # Speech in and out happen once per turn, often with long gaps. httpx drops idle pooled
@@ -42,12 +57,16 @@ class ElevenLabs:
 
     async def speak(self, text: str) -> AsyncIterator[bytes]:
         """Yields raw PCM16 mono at TTS_RATE as it streams in."""
+        voice = self.devil_voice_id if self.devil else self.voice_id
+        body: dict = {"text": text, "model_id": self.tts_model}
+        if self.devil:
+            body["voice_settings"] = DEVIL_VOICE
         async with self.http.stream(
             "POST",
-            f"{API}/v1/text-to-speech/{self.voice_id}/stream",
+            f"{API}/v1/text-to-speech/{voice}/stream",
             params={"output_format": TTS_FORMAT},
             headers={**self.headers, "Content-Type": "application/json"},
-            json={"text": text, "model_id": self.tts_model},
+            json=body,
         ) as r:
             if r.status_code >= 400:
                 body = await r.aread()

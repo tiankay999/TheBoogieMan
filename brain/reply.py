@@ -95,8 +95,10 @@ TOOLS: list[dict[str, Any]] = [
 
 def load_text(name: str) -> str:
     try:
-        return (HERE / name).read_text().strip()
-    except OSError:
+        # Explicit UTF-8: persona.md and boss.md carry Pidgin, accents and smart quotes, and the
+        # locale default (cp1252 on Windows) either mangles them or refuses outright.
+        return (HERE / name).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
         return ""
 
 
@@ -115,6 +117,7 @@ class Replier:
     ):
         self.memory = memory or Memory()
         self.on_memory = on_memory
+        self.devil = False  # devil mode: colder, shorter, meaner. Same limits (see devil.md).
         # Extra tools registered by the app: name -> (schema, async handler(args) -> result str)
         self.extra: dict[str, tuple[dict[str, Any], Callable[[dict[str, Any]], Awaitable[str]]]] = {}
         self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=CONNECT_TIMEOUT), transport=_transport())
@@ -185,6 +188,10 @@ class Replier:
         )
         local = datetime.now().astimezone()
         parts.append(f"## Now\n{local.strftime('%A %d %B %Y, %H:%M')} ({local.tzname()})")
+        if self.devil:
+            # Last, so it colours everything above it. A tone shift only: devil.md restates
+            # that every limit from the normal persona still applies.
+            parts.append(load_text("devil.md") or "Devil mode: answer in one cold, flat sentence. Same limits as always.")
         return "\n\n".join(parts)
 
     async def reply(self, text: str) -> str:
@@ -222,6 +229,11 @@ class Replier:
         except httpx.HTTPError as e:
             log.warning("%s unreachable: %s", self.provider, e)
             return "I can't reach my brain right now, boss. Check the internet."
+        except Exception:
+            # Last resort. Anything unexpected here used to escape into the voice loop and leave
+            # him silent for the turn; the traceback still goes to the terminal, but he answers.
+            log.exception("reply failed unexpectedly")
+            return "Something broke on my side, boss. Say that again."
         out = out.strip() or "Done, boss."
         self.memory.add_turn(text, out)
         return out
@@ -311,9 +323,14 @@ class Replier:
     async def _anthropic(self, text: str) -> str:
         messages: list[dict[str, Any]] = [*self.history, {"role": "user", "content": text}]
         tools = [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in self.tools]
+        # Build the system prompt once and reuse it for every round. It carries the current time
+        # down to the minute, and the signature on a thinking block is bound to the conversation
+        # prefix: if a tool runs across a minute boundary, a rebuilt prompt invalidates it and the
+        # whole turn comes back as a 400.
+        system = self.system_prompt()
         for _ in range(MAX_TOOL_ROUNDS):
             msg = await self.anthropic.messages.create(  # type: ignore[union-attr]
-                model=self.model, max_tokens=700, system=self.system_prompt(), messages=messages, tools=tools
+                model=self.model, max_tokens=700, system=system, messages=messages, tools=tools
             )
             uses = [b for b in msg.content if getattr(b, "type", "") == "tool_use"]
             if not uses:

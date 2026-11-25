@@ -527,3 +527,70 @@ def test_devil_mode_commands():
     for off in ["Exit devil mode", "turn off devil mode", "stand down", "devil mode off", "leave the devil mode"]:
         assert c.handle(off)[1] == "devil:off", off
     assert c.handle("exit work mode")[1] == "normal"
+
+
+# ── memory must survive non-ASCII speech (Pidgin, Thai, emoji, smart quotes) ──
+def test_memory_round_trips_non_ascii():
+    """cp1252 is the Windows locale codec and cannot encode these; UTF-8 must be explicit."""
+    import tempfile as tf
+    from pathlib import Path as P
+
+    from memory import Memory
+
+    m = Memory(P(tf.mkdtemp()) / "memory.json")
+    hard = "เพลงใน Tone up — chale, e dey bee 🔥 “smart quotes” café"
+    m.add_turn(hard, "I dey feel you, boss — 100%")
+    m.remember("The boss listens to เพลงไทย")
+
+    again = Memory(m.path)
+    assert again.history[0]["content"] == hard
+    assert again.history[1]["content"] == "I dey feel you, boss — 100%"
+    assert any("เพลงไทย" in f["text"] for f in again.facts)
+
+
+def test_memory_save_failure_never_raises():
+    """A storage problem must not escape and kill the voice turn."""
+    import tempfile as tf
+    from pathlib import Path as P
+
+    from memory import Memory
+
+    m = Memory(P(tf.mkdtemp()) / "memory.json")
+    m.path = P(tf.mkdtemp()) / "no-such-dir" / "\0bad" / "memory.json"  # unwritable by construction
+    m.add_turn("still", "talking")  # must not raise
+    assert m.history[-1]["content"] == "talking"
+
+
+def test_tts_failure_messages_are_readable():
+    import httpx as _h
+
+    from voice import tts_failure
+
+    quota = _h.HTTPStatusError('TTS failed 401: {"code":"quota_exceeded","message":"0 credits remaining"}', request=None, response=None)  # type: ignore[arg-type]
+    assert "credits used up" in tts_failure(quota)
+    perms = _h.HTTPStatusError('TTS failed 401: {"status":"missing_permissions"}', request=None, response=None)  # type: ignore[arg-type]
+    assert "text_to_speech permission" in tts_failure(perms)
+    assert "internet" in tts_failure(_h.ConnectTimeout("nope"))
+
+
+def test_say_survives_a_failing_tts():
+    """A dead TTS must report itself, not take the voice loop down."""
+    import asyncio as _a
+
+    events = []
+
+    async def emit(kind, payload):
+        events.append((kind, payload))
+
+    async def boom(_text):
+        raise RuntimeError("quota_exceeded: 0 credits remaining")
+        yield b""  # pragma: no cover - makes this an async generator
+
+    class Spk:
+        def write(self, pcm):
+            pass
+
+    loop = VoiceLoop(emit, None, Spk(), None, boom, lambda t: t)
+    _a.run(loop.say("anything"))  # must not raise
+    errors = [p for k, p in events if k == "voice.state" and p.get("state") == "error"]
+    assert errors and "credits used up" in errors[0]["detail"]

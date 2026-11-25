@@ -365,14 +365,14 @@ export default function Scene({ state, mode, booted, work = false }: { state: Ey
       >
         <Rig state={state} mode={mode} booted={booted} work={work} />
         <EffectComposer multisampling={0}>
-          <Bloom mipmapBlur intensity={devil ? 1.6 : 1.0} luminanceThreshold={0.2} luminanceSmoothing={0.3} radius={0.75} />
+          <Bloom mipmapBlur intensity={devil ? 2.3 : 1.0} luminanceThreshold={devil ? 0.12 : 0.2} luminanceSmoothing={0.3} radius={devil ? 0.9 : 0.75} />
           <ChromaticAberration
-            offset={devil ? new THREE.Vector2(0.0012, 0.0008) : new THREE.Vector2(0.0002, 0.0002)}
+            offset={devil ? new THREE.Vector2(0.0026, 0.0018) : new THREE.Vector2(0.0002, 0.0002)}
             radialModulation={false}
             modulationOffset={0}
           />
-          <Noise opacity={devil ? 0.07 : 0.03} />
-          <Vignette eskil={false} offset={0.2} darkness={devil ? 0.95 : 0.85} />
+          <Noise opacity={devil ? 0.12 : 0.03} />
+          <Vignette eskil={false} offset={devil ? 0.12 : 0.2} darkness={devil ? 1.25 : 0.85} />
         </EffectComposer>
       </Canvas>
     </div>

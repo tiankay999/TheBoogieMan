@@ -7,12 +7,15 @@ so it never gets committed.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("brain.memory")
 
 MAX_HISTORY = 30  # messages kept across restarts
 MAX_FACTS = 300
@@ -39,12 +42,12 @@ class Memory:
 
     def load(self) -> None:
         try:
-            data = json.loads(self.path.read_text())
+            data = json.loads(self.path.read_text(encoding="utf-8"))
             self.facts = [f for f in data.get("facts", []) if f.get("text")]
             self.history = [m for m in data.get("history", []) if m.get("role") in ("user", "assistant")]
         except FileNotFoundError:
             pass
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             # Keep a copy of a broken file instead of silently losing it.
             try:
                 self.path.rename(self.path.with_suffix(".broken.json"))
@@ -53,10 +56,21 @@ class Memory:
 
     def save(self) -> None:
         with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"facts": self.facts, "history": self.history}, indent=2, ensure_ascii=False))
-            tmp.replace(self.path)  # atomic
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_suffix(".tmp")
+                # Always UTF-8. The default is the locale codec, which on Windows is cp1252 and
+                # cannot encode Pidgin, Thai, emoji or smart quotes.
+                tmp.write_text(
+                    json.dumps({"facts": self.facts, "history": self.history}, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                tmp.replace(self.path)  # atomic
+            except (OSError, ValueError) as e:
+                # Failing to write is bad; losing his voice is worse. A raise here used to escape
+                # reply(), kill the turn, and then kill every turn after it, because the text it
+                # choked on stayed in history. Log it and keep talking.
+                log.warning("couldn't save memory: %s", e)
 
     # ── facts ──
     def remember(self, text: str) -> dict[str, str]:

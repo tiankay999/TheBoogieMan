@@ -64,6 +64,9 @@ pub fn spawn(port: u16) -> std::io::Result<Child> {
         .current_dir(&dir)
         .env("BOOGEYMAN_BRAIN_PORT", port.to_string())
         .env("PYTHONUNBUFFERED", "1")
+        // Python would otherwise encode stdout/stderr with the locale codec (cp1252 on Windows),
+        // which mangles Pidgin, Thai and emoji in the log lines we forward to the terminal.
+        .env("PYTHONIOENCODING", "utf-8")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
