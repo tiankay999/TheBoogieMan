@@ -15,13 +15,24 @@ fn brain_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../brain")
 }
 
-/// Prefer the brain's own virtualenv, fall back to system python3.
+/// Prefer the brain's own virtualenv, fall back to the system interpreter.
+/// Virtualenvs differ by platform: POSIX puts it in bin/python, Windows in Scripts/python.exe.
 fn python_bin(dir: &Path) -> PathBuf {
     if let Ok(py) = std::env::var("BOOGEYMAN_PYTHON") {
         return PathBuf::from(py);
     }
-    let venv = dir.join(".venv/bin/python");
-    if venv.exists() { venv } else { PathBuf::from("python3") }
+    let venv = if cfg!(windows) {
+        dir.join(".venv/Scripts/python.exe")
+    } else {
+        dir.join(".venv/bin/python")
+    };
+    if venv.exists() {
+        venv
+    } else if cfg!(windows) {
+        PathBuf::from("python")
+    } else {
+        PathBuf::from("python3")
+    }
 }
 
 /// Ask the OS for a free localhost port.

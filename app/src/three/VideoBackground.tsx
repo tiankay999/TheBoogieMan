@@ -12,6 +12,11 @@ function bgLog(line: string) {
 
 const STALL_MS = 4000 // a video that hasn't moved for this long counts as stuck
 
+/** Only Linux/WebKitGTK needs the GStreamer codec packages; other webviews decode natively. */
+export const IS_LINUX =
+  typeof navigator !== 'undefined' && /Linux|X11/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent)
+const CODEC_FIX = IS_LINUX ? ' Fix: sudo apt install gstreamer1.0-plugins-good gstreamer1.0-libav, then restart.' : ''
+
 /**
  * Background videos playing behind everything, seen through a blur layer.
  * The blur is cheap and works everywhere: each frame is drawn into a small canvas
@@ -81,7 +86,7 @@ export default function VideoBackground({ devil }: { devil: React.RefObject<numb
         const can = ['video/webm; codecs="vp9"', 'video/webm; codecs="vp8"', 'video/mp4; codecs="avc1.42E01E"']
           .map((t) => `${t.split(';')[0]}/${t.split('"')[1]}=${video.canPlayType(t) || 'no'}`)
           .join(' ')
-        bgLog(`${bg.name}: no source would play (${can}). Fix: sudo apt install gstreamer1.0-plugins-good gstreamer1.0-libav, then restart.`)
+        bgLog(`${bg.name}: no source would play (${can}).${CODEC_FIX}`)
         if (bg.name !== 'nebula') hud.bgName = 'nebula' // don't leave him on a black screen
         return
       }
@@ -97,6 +102,12 @@ export default function VideoBackground({ devil }: { devil: React.RefObject<numb
       const e = video.error
       bgLog(`${video.currentSrc || video.src}: error ${e?.code ?? '?'} ${e?.message ?? ''} — trying the next file`)
       next()
+    }
+    // Belt and braces for webviews that don't honour video.loop (WebView2 on Windows):
+    // if 'ended' fires at all, restart from the top ourselves.
+    video.onended = () => {
+      video.currentTime = 0
+      video.play().catch(() => {})
     }
     next()
   }
