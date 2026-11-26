@@ -3,19 +3,22 @@
 Two paths, and keeping them apart is the whole point.
 
 A *look* is the expensive one: grab, downscale, encode, upload, and a second or so of model
-time. A *sense* is the cheap one: the screen crushed to a 32x32 grey grid, which costs about
-90 ms and no money at all. Comparing two senses says whether anything happened. Study mode
-leans on that - it senses twice a second and only spends a look once the picture has moved
-and then gone still - so the cheap path skips the full-size resize and the encoder entirely.
+time. A *sense* is the cheap one: the screen crushed to a GRID x GRID grey grid, which costs
+about 50 ms and no money at all. Comparing two senses says whether anything happened. Study
+mode leans on that - it senses a few times a second and only spends a look once the picture
+has moved and then gone still - so the cheap path skips the full-size resize and the encoder
+entirely.
 
-Measured on a 1920x1080 screen, which is why the defaults are what they are:
+Measured on a 1920x1080 screen, which is why the defaults are what they are. These are one
+machine's numbers - Pillow's resize in particular has got quicker - so take the shape rather
+than the absolutes: the grey downsample is free next to the capture, and the capture is free
+next to the model call at the end of a look.
 
-    capture (mss)                  58 ms
-    bytes -> RGB                   24 ms
-    reduce(8) -> 32x32 grey         4 ms   <- sense stops here, ~86 ms
-    resize LANCZOS to 1568        111 ms
-    JPEG q92 encode                14 ms   262 KB   <- look, ~210 ms
-    PNG level 1 encode            107 ms   862 KB   (the alternative, 3.3x the bytes)
+    capture (mss, incl. bytes -> RGB)   50 ms
+    reduce(8) -> 48x48 grey              2 ms   <- sense stops here, ~52 ms
+    resize LANCZOS to 1568              42 ms
+    JPEG q92 encode                      5 ms   289 KB   <- look, ~110 ms
+    PNG level 1 encode                  44 ms   882 KB   (the alternative, 3x the bytes)
 
 JPEG rather than PNG because the usual objection to it does not survive measurement: asked to
 transcribe 11-pixel footer text and a random serial number off a rendered quiz, the model read

@@ -7,7 +7,7 @@ one properly.
 
 How it avoids burning money and talking over itself:
 
-  * Looking costs a model call; noticing costs 63 ms. The loop only ever senses (see eyes.py),
+  * Looking costs a model call; noticing costs about 50 ms. The loop only ever senses (eyes.py),
     and spends a look when the screen has moved and then gone still for SETTLE polls. A page
     being drawn, a list animating in, a scroll in progress - none of those get read half-done.
   * Every look is deduplicated on the question itself, so clicking an option, moving the mouse
