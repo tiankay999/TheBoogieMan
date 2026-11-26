@@ -11,8 +11,12 @@ Events (pushed to the UI, no id):
   voice.reply      {text}
 
 Barge-in: while he speaks the mic stays open. If you talk over him (louder than the echo of
-his own voice, for ~1/4 s) he stops mid-sentence and listens. "Pause" / "stop" / "wait" just
+his own voice, for ~1/5 s) he stops mid-sentence and listens. "Pause" / "stop" / "wait" just
 keeps him quiet; "continue" / "go on" picks up roughly where he stopped.
+
+The gate that decides "you" from "his own voice coming back" is the delicate part, and it was
+set far too high: measured against real playback it sat at 0.316 while conversational speech
+into a laptop mic is about 0.10, so only a shout got through. See the BARGE_* constants.
 """
 
 from __future__ import annotations
@@ -37,7 +41,21 @@ CHUNK = 1024  # playback block (~43 ms at 24 kHz): one level update each
 BARGE_IN = os.environ.get("BOOGEYMAN_BARGE_IN", "1").lower() not in ("0", "off", "false", "no")
 # Higher = you must talk louder to interrupt him. Raise it if he cuts himself off on loud speakers.
 BARGE_SENSITIVITY = float(os.environ.get("BOOGEYMAN_BARGE_LEVEL", "1.0"))
-BARGE_FRAMES = 8  # ~240 ms of you talking over him
+BARGE_FRAMES = 6  # ~180 ms of you talking over him
+# How much of his own voice is assumed to come back through the mic before anything is known.
+# This starts low on purpose. The two ways of being wrong are not symmetric: too sensitive and
+# he clips himself, which you hear immediately and the learner below corrects within a second;
+# too insensitive and he simply never stops, which looks like the feature doesn't exist - and
+# it never recovers, because the learner only runs on frames that were NOT a barge-in. So err
+# towards interrupting. It was 0.6, which put the gate above a raised voice from the start.
+BARGE_COUPLING0 = 0.15
+BARGE_MULT = 1.8  # safety factor over the expected echo; was 2.5
+BARGE_COUPLING_MAX = 1.5  # was 3.0, which could pin the gate at 1.58 - unreachable forever
+# Absolute ceiling, whatever the echo learner believes. Measured against real playback, speech
+# into a laptop mic sits near 0.10 and a clearly raised voice near 0.20, so a gate above this
+# cannot be cleared by a human being and the feature is dead. Scales with BARGE_SENSITIVITY so
+# raising that for loud speakers still lifts the ceiling with it.
+BARGE_CEILING = float(os.environ.get("BOOGEYMAN_BARGE_CEILING", "0.18"))
 CHARS_PER_SEC = 14.0  # rough speaking rate, to find where he stopped
 
 PAUSE = re.compile(r"^\W*(pause|stop|wait|hold\s*on|hold\s*up|shh+|quiet|be\s*quiet|shut\s*up|one\s*sec(ond)?|enough|ok(ay)?\s*stop)\b", re.I)
@@ -94,7 +112,7 @@ class VoiceLoop:
         self.interrupt = asyncio.Event()
         self.recent: deque[np.ndarray] = deque(maxlen=14)  # ~400 ms of mic while he talks
         self.play_levels: deque[float] = deque(maxlen=5)  # what he just played (echo reference)
-        self.coupling = 0.6  # learned: how loud his own voice comes back through the mic
+        self.coupling = BARGE_COUPLING0  # learned: how loud his own voice comes back
         self.barge_n = 0
         self.unsaid: str | None = None  # the rest of a reply you cut off
         self.tasks: set[asyncio.Task] = set()
@@ -145,13 +163,17 @@ class VoiceLoop:
         self.recent.append(frame)
         level = rms(frame)
         play = max(self.play_levels, default=0.0)
-        gate = max(self.seg.threshold * 4.0, self.coupling * play * 2.5, 0.02) * BARGE_SENSITIVITY
+        gate = max(self.seg.threshold * 4.0, self.coupling * play * BARGE_MULT, 0.02)
+        gate = min(gate, BARGE_CEILING) * BARGE_SENSITIVITY
         if level > gate:
             self.barge_n += 1
         else:
-            self.barge_n = 0
+            # Decay rather than reset. Real speech dips between words and syllables, and
+            # zeroing the count on one quiet frame meant he needed 180 ms of unbroken volume
+            # that ordinary talking never provides.
+            self.barge_n = max(0, self.barge_n - 1)
             if play > 0.01:  # learn the echo from frames that are clearly just him
-                self.coupling = min(3.0, self.coupling * 0.97 + (level / play) * 0.03)
+                self.coupling = min(BARGE_COUPLING_MAX, self.coupling * 0.97 + (level / play) * 0.03)
         if self.barge_n >= BARGE_FRAMES:
             log.info("barge-in: you talked over him (mic %.3f > %.3f)", level, gate)
             self.barge_n = 0

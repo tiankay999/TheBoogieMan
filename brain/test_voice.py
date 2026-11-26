@@ -594,3 +594,94 @@ def test_say_survives_a_failing_tts():
     _a.run(loop.say("anything"))  # must not raise
     errors = [p for k, p in events if k == "voice.state" and p.get("state") == "error"]
     assert errors and "credits used up" in errors[0]["detail"]
+
+
+# ── the barge-in gate ──
+# This was wholly untested, and wrong: measured against real playback the gate sat at 0.316
+# while conversational speech into a laptop mic is about 0.10, so only a shout stopped him.
+# These pin the levels at which he must and must not stop.
+import voice as vc  # noqa: E402
+from audio import rms  # noqa: E402
+
+PLAY_PEAK = 0.211  # measured rms of the loudest playback block of a real reply
+ECHO = 0.03  # his own voice coming back through the mic
+TALKING = 0.10  # normal conversational speech
+RAISED = 0.20  # a clearly raised voice
+
+
+def barge_loop(play_peak=PLAY_PEAK, coupling=None, noise=0.003):
+    async def emit(*a, **k):
+        return None
+
+    async def reply(_):
+        return ""
+
+    v = VoiceLoop(emit, None, None, None, None, reply)
+    for _ in range(v.seg.calibrate_frames):
+        v.seg.feed(_noise(noise))
+    v.play_levels.extend([play_peak] * 5)
+    if coupling is not None:
+        v.coupling = coupling
+    v.speaking = True
+    return v
+
+
+def _noise(amp, n=FRAME):
+    return (np.random.normal(0, amp, n) * 32768).astype(np.int16)
+
+
+def talk_over(v, amp, n=14, every_nth_quiet=0):
+    """Feed n frames of you talking at amp. Returns True if he stopped."""
+    for i in range(n):
+        quiet = every_nth_quiet and i % every_nth_quiet == every_nth_quiet - 1
+        asyncio.run(v.watch_barge(_noise(0.004 if quiet else amp)))
+        if v.interrupt.is_set():
+            return True
+    return False
+
+
+def test_normal_speech_stops_him():
+    """The bug the boss reported: talking over him at a normal volume did nothing."""
+    assert talk_over(barge_loop(), TALKING)
+
+
+def test_a_raised_voice_stops_him():
+    assert talk_over(barge_loop(), RAISED)
+
+
+def test_his_own_echo_does_not_stop_him():
+    assert not talk_over(barge_loop(), ECHO, n=40)
+
+
+def test_gaps_between_words_do_not_stop_it_counting():
+    """barge_n used to reset to zero on one quiet frame, so ordinary speech never qualified."""
+    assert talk_over(barge_loop(), TALKING, n=24, every_nth_quiet=3)
+
+
+def test_the_gate_can_never_become_unreachable():
+    """The learner was capped at 3.0, which allowed a gate of 1.58 - no voice can clear that.
+
+    Whatever it has learned, and however loud the speakers are, a raised voice must still work
+    or the feature is silently dead for the rest of the session.
+    """
+    v = barge_loop(play_peak=0.5, coupling=vc.BARGE_COUPLING_MAX)
+    assert talk_over(v, RAISED)
+
+
+def test_the_echo_learner_is_bounded():
+    v = barge_loop()
+    for _ in range(400):  # a long stretch of loud echo
+        asyncio.run(v.watch_barge(_noise(0.2)))
+        v.interrupt.clear()
+    assert v.coupling <= vc.BARGE_COUPLING_MAX
+
+
+def test_the_learner_starts_sensitive_not_deaf():
+    """Erring towards interrupting is deliberate: too-deaf never self-corrects."""
+    assert vc.BARGE_COUPLING0 < 0.3
+    gate = max(0.012 * 4.0, vc.BARGE_COUPLING0 * PLAY_PEAK * vc.BARGE_MULT, 0.02)
+    assert min(gate, vc.BARGE_CEILING) < TALKING, "normal speech cannot clear a fresh gate"
+
+
+def test_the_ceiling_leaves_room_for_a_raised_voice():
+    assert vc.BARGE_CEILING < RAISED
