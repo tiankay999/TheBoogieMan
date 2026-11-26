@@ -67,8 +67,10 @@ class Segmenter:
 
     calibrate_frames: int = 33  # ~1 s of room noise
     start_frames: int = 3  # ~90 ms above threshold to start
-    end_ms: int = 800  # silence that ends an utterance
-    min_ms: int = 350
+    # Silence that ends an utterance. Every millisecond of this is dead air he makes you sit
+    # through after you've stopped talking, so it is kept as short as reliably works.
+    end_ms: int = 550
+    min_ms: int = 120  # of *voiced* audio: less than this is a click, a cough or a door
     max_ms: int = 15000
     preroll_frames: int = 10  # keep ~300 ms before speech starts
 
@@ -77,6 +79,7 @@ class Segmenter:
     speaking: bool = False
     above: int = 0
     silent: int = 0
+    lead: int = 0  # frames of preroll prepended to this utterance (silence, not speech)
     frames: list[np.ndarray] = field(default_factory=list)
     preroll: deque = field(default_factory=lambda: deque(maxlen=10))
 
@@ -102,6 +105,7 @@ class Segmenter:
             if self.above >= self.start_frames:
                 self.speaking = True
                 self.frames = list(self.preroll)
+                self.lead = len(self.preroll)
                 self.silent = 0
             return None
 
@@ -110,8 +114,12 @@ class Segmenter:
         dur = len(self.frames) * FRAME_MS
         if self.silent * FRAME_MS >= self.end_ms or dur >= self.max_ms:
             out = np.concatenate(self.frames)
+            # How much of this was actually someone talking: the preroll at the front and the
+            # silence at the back are both padding. Measuring the middle instead of
+            # "everything minus end_ms" keeps the click filter honest when end_ms changes.
+            voiced = dur - (self.lead + self.silent) * FRAME_MS
             self.reset()
-            if dur - self.end_ms < self.min_ms:
+            if voiced < self.min_ms:
                 return None  # a click or a cough, not speech
             return out
         return None
@@ -120,6 +128,7 @@ class Segmenter:
         self.speaking = False
         self.above = 0
         self.silent = 0
+        self.lead = 0
         self.frames = []
         self.preroll.clear()
 

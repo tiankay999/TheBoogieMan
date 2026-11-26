@@ -8,3 +8,7 @@ anthropic>=0.40
 ddgs>=9.0
 psutil>=5.9
 pynput>=1.7
+edge-tts>=7.0
+miniaudio>=1.59
+mss>=10.0
+pillow>=10.0

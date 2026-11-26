@@ -69,6 +69,8 @@ class VoiceLoop:
         reply: Callable[[str], Awaitable[str]],
         tts_rate: int = 24000,
         after_turn: Callable[[], Awaitable[None]] | None = None,
+        reply_stream: Callable[[str], AsyncIterator[str]] | None = None,
+        tts_obj: Any | None = None,
     ):
         self.tts_rate = tts_rate
         self.after_turn = after_turn  # runs once the reply has been spoken (e.g. shutdown)
@@ -78,6 +80,10 @@ class VoiceLoop:
         self.transcribe = transcribe
         self.tts = tts
         self.reply = reply
+        # Together these two enable the live path: a brain that can hand text over in pieces and
+        # a voice that can synthesize one piece at a time. Without both, he buffers as before.
+        self.reply_stream = reply_stream
+        self.tts_obj = tts_obj
         self.muted = False
         self.busy = asyncio.Lock()
         self.seg = Segmenter()
@@ -194,13 +200,51 @@ class VoiceLoop:
             async with self.busy:
                 return await self.respond(text, locked=True)
         await self.state("thinking")
-        out = await self.reply(text)
-        log.info("reply: %r", out[:160])
-        await self.emit("voice.reply", {"text": out})
-        if out.strip():
-            await self.say(out, locked=True)
+        piece = getattr(self.tts_obj, "piece", None) if self.tts_obj else None
+        if self.reply_stream and piece and self.speaker:
+            out = await self.respond_live(text, piece)
+        else:
+            out = await self.reply(text)
+            log.info("reply: %r", out[:160])
+            await self.emit("voice.reply", {"text": out})
+            if out.strip():
+                await self.say(out, locked=True)
         if self.after_turn:
             await self.after_turn()
+        return out
+
+    async def respond_live(self, text: str, piece) -> str:
+        """Think and talk at the same time.
+
+        Waiting for the last token before synthesizing the first word put a second and a half of
+        silence in front of every answer. Here the opening clause is sent to be spoken as soon as
+        it is written, and the rest of the thinking happens behind his own voice.
+        """
+        from freevoice import speak_live
+
+        said: list[str] = []
+        shown = False
+
+        async def written() -> AsyncIterator[str]:
+            nonlocal shown
+            async for t in self.reply_stream(text):  # type: ignore[misc]
+                said.append(t)
+                yield t
+            out = "".join(said).strip()
+            if out:
+                # He is still talking; put the text on screen now rather than when he finishes.
+                log.info("reply: %r", out[:160])
+                await self.emit("voice.reply", {"text": out})
+                shown = True
+
+        played = await self._speak(speak_live(piece, written()))
+        out = "".join(said).strip()
+        if out and not shown:  # cut off before the brain finished
+            log.info("reply (cut short): %r", out[:160])
+            await self.emit("voice.reply", {"text": out})
+        if self.interrupt.is_set():
+            self.unsaid = rest_of(out, played / self.tts_rate)
+            log.info("interrupted after %.1fs; %d chars unsaid", played / self.tts_rate, len(self.unsaid or ""))
         return out
 
     async def say(self, text: str, locked: bool = False) -> None:
@@ -209,6 +253,16 @@ class VoiceLoop:
                 return await self.say(text, locked=True)
         if not (self.tts and self.speaker):
             return
+        played = await self._speak(self.tts(text))
+        if self.interrupt.is_set():
+            self.unsaid = rest_of(text, played / self.tts_rate)
+            log.info("interrupted after %.1fs; %d chars unsaid", played / self.tts_rate, len(self.unsaid or ""))
+
+    async def _speak(self, pcm: AsyncIterator[bytes]) -> int:
+        """Play audio as it arrives, watching the mic for you talking over him.
+
+        Returns the number of samples played, which is how far through the reply he actually got.
+        """
         await self.state("speaking")
         self.interrupt.clear()
         self.play_levels.clear()
@@ -218,7 +272,7 @@ class VoiceLoop:
         played = 0
         buf = b""
         try:
-            async for chunk in self.tts(text):
+            async for chunk in pcm:
                 buf += chunk
                 usable = len(buf) - (len(buf) % (CHUNK * 2))
                 for i in range(0, usable, CHUNK * 2):
@@ -241,9 +295,7 @@ class VoiceLoop:
         finally:
             self.speaking = False
             await self.emit("voice.level", {"source": "voice", "level": 0.0})
-        if self.interrupt.is_set():
-            self.unsaid = rest_of(text, played / self.tts_rate)
-            log.info("interrupted after %.1fs; %d chars unsaid", played / self.tts_rate, len(self.unsaid or ""))
+        return played
 
     async def play_block(self, pcm: np.ndarray) -> None:
         self.play_levels.append(rms(pcm))

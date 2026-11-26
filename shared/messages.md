@@ -57,6 +57,7 @@ Events (brain → React, empty `id`, arrive as the `brain-message` Tauri event):
 | `task.*`           | research progress: start, step, queries, source, reading, metric, finding, done (see `brain/research.py`) |
 | `app.shutdown`     | `{}`: he has said goodbye; the UI powers down and quits                                    |
 | `memory.updated`   | `{ "facts": [{id, text, at}], "turns" }`                                                  |
+| `study.answer`     | `{ "question", "answer", "why" }`: study mode read a question off the screen             |
 
 Memory requests: `memory.get` → `memory.updated`; `memory.forget {id}` → `memory.updated`.
 

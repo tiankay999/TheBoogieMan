@@ -28,6 +28,8 @@ class Settings:
     stt_model: str
     mic_device: str | None
     voice_enabled: bool
+    tts_provider: str
+    stt_provider: str
 
 
 def load() -> Settings:
@@ -48,4 +50,8 @@ def load() -> Settings:
         stt_model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v2"),
         mic_device=os.environ.get("BOOGEYMAN_MIC") or None,
         voice_enabled=os.environ.get("BOOGEYMAN_VOICE", "1") != "0",
+        # auto = ElevenLabs when its key is set (falling back to the free stack the moment it
+        # refuses), otherwise straight to free. Force one with "elevenlabs", "edge" or "groq".
+        tts_provider=os.environ.get("BOOGEYMAN_TTS", "auto").lower(),
+        stt_provider=os.environ.get("BOOGEYMAN_STT", "auto").lower(),
     )

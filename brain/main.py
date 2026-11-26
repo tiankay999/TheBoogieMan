@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import sys
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -24,11 +25,14 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import config
+import eyes
 import hands
 from commands import Commands
 from memory import Memory
 from reply import Replier
 from research import Research
+from study import Study
+from study import wanted as study_wanted
 from voice import VoiceLoop
 
 log = logging.getLogger("brain")
@@ -80,7 +84,20 @@ replier = Replier(
     on_memory=push_memory,
 )
 commands = Commands()
-state: dict[str, Any] = {"greeted": False, "capabilities": {}, "action": None, "devil": False, "tts": None}
+state: dict[str, Any] = {"greeted": False, "capabilities": {}, "action": None, "devil": False, "tts": None, "edge": None, "ears": None}
+# Study mode. `voice` is built further down (it needs think(), which needs this), so the two
+# hooks into it are lambdas: both are resolved when he actually speaks, by which time it exists.
+study = Study(
+    replier.look,
+    lambda t: voice.say(t),
+    hub.emit,
+    quiet=lambda: not voice.speaking,
+)
+ORPHEUS_NOTE = (
+    "Orpheus can't be used with this key, so the Edge voice is being used instead. That is no "
+    "loss: measured head to head, Orpheus starts about 600ms sooner but then talks 1.43s "
+    "longer, and its speed parameter is ignored, so Edge wins by roughly 800ms a reply."
+)
 
 
 async def set_devil(on: bool) -> None:
@@ -125,8 +142,28 @@ async def run_research(query: str) -> str:
     return "\n".join(lines)
 
 
+async def study_command(text: str) -> str | None:
+    """Study mode's own triggers, which run ahead of everything else.
+
+    Each returns None when it isn't really a command for this mode, so the sentence falls
+    through to the normal path: "stop studying" with nothing running, or "explain that" when
+    he has never looked at a screen, are both just things the boss said.
+    """
+    want = study_wanted(text)
+    if want is None:
+        return None
+    if want == "on":
+        return await study.start()
+    if want == "off":
+        return await study.stop() if study.on else None
+    return await study.further() if study.last_shot else None
+
+
 async def think(text: str) -> str:
     """Built-in commands first (instant, offline), then the LLM."""
+    said = await study_command(text)
+    if said is not None:
+        return said
     hit = commands.handle(text)
     if hit:
         out, action = hit
@@ -139,6 +176,33 @@ async def think(text: str) -> str:
         result = await run_research(m.group(1).strip(" .?!"))
         return result.split("\n", 1)[0].removeprefix("Summary: ")
     return await replier.reply(text)
+
+
+async def think_stream(text: str) -> AsyncIterator[str]:
+    """think(), handed over in pieces so the voice can start before the brain has finished.
+
+    The first two tiers answer instantly and have nothing to stream, so they yield once. Only
+    the LLM tier benefits, which is also the only one that was ever slow.
+    """
+    said = await study_command(text)
+    if said is not None:
+        yield said
+        return
+    hit = commands.handle(text)
+    if hit:
+        out, action = hit
+        state["action"] = await ui_action(action)
+        log.info("command: %r -> %s", text, action or "reply")
+        yield out
+        return
+    m = RESEARCH_CMD.match(text.strip())
+    if m:
+        await hub.emit("voice.state", {"state": "thinking"})
+        result = await run_research(m.group(1).strip(" .?!"))
+        yield result.split("\n", 1)[0].removeprefix("Summary: ")
+        return
+    async for part in replier.reply_stream(text):
+        yield part
 
 
 async def tool_shutdown(args: dict[str, Any]) -> str:
@@ -409,6 +473,72 @@ replier.add_tool(
     },
     tool_type_text,
 )
+async def tool_look(args: dict[str, Any]) -> str:
+    if not eyes.HAVE_EYES:
+        return "Error: screen capture isn't installed. Run: pip install mss pillow"
+    if not replier.can_see:
+        return "Error: this brain has no model that can look at an image."
+    try:
+        shot = await eyes.grab()
+    except eyes.Blind as e:
+        return f"Error: {e}"
+    question = str(args.get("question") or "").strip() or "What is on this screen?"
+    return await replier.look(
+        "You are looking at the boss's screen and telling him what is there. He cannot see it "
+        "through you, so be specific: name what you actually read. Two or three sentences.",
+        question,
+        shot,
+        eyes.MEDIA,
+    )
+
+
+replier.add_tool(
+    {
+        "name": "look_at_screen",
+        "description": "Look at the boss's screen and answer a question about what is on it. Use this "
+        "whenever he asks what something says, what he is looking at, what an error means, or why "
+        "something on screen is wrong. Prefer it over guessing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "What to find out from the screen, e.g. 'what does this error say?'",
+                }
+            },
+            "required": [],
+        },
+    },
+    tool_look,
+)
+
+
+async def tool_study(args: dict[str, Any]) -> str:
+    on = args.get("on")
+    if on is None:
+        on = True
+    return await study.start() if on else await study.stop()
+
+
+replier.add_tool(
+    {
+        "name": "study_mode",
+        "description": "Turn study mode on or off. While it is on he watches the boss's screen and, "
+        "each time a question appears, says the answer and one short reason, then does the same for "
+        "the next question. Use it whenever he asks you to watch his screen, help him study or revise, "
+        "or go through questions with him. This exists: never tell him there is no study mode.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "on": {"type": "boolean", "description": "true to start watching, false to stop."}
+            },
+            "required": ["on"],
+        },
+    },
+    tool_study,
+)
+
+
 replier.add_tool(
     {
         "name": "research",
@@ -432,7 +562,7 @@ async def after_turn() -> None:
         await hub.emit("app.shutdown", {})
 
 
-voice = VoiceLoop(hub.emit, None, None, None, None, think, after_turn=after_turn)
+voice = VoiceLoop(hub.emit, None, None, None, None, think, after_turn=after_turn, reply_stream=think_stream)
 tasks: set[asyncio.Task] = set()
 
 
@@ -443,13 +573,27 @@ def spawn(coro) -> None:
 
 
 def setup_voice() -> dict[str, Any]:
-    """Wire up whatever voice pieces are available. Missing pieces degrade gracefully."""
-    caps: dict[str, Any] = {"brain": replier.label, "claude": replier.online, "elevenlabs": False, "mic": False, "speaker": False, "notes": []}
+    """Pick ears and a voice from what's available, and degrade instead of going quiet.
+
+    ElevenLabs is used when its key is set, but it runs out of credits and keys arrive with the
+    wrong permissions, so `auto` wraps it: the first time it refuses for good, he moves to the
+    free stack (Edge for the voice, Groq Whisper for the ears) and stays there for the session.
+    """
+    caps: dict[str, Any] = {
+        "brain": replier.label, "claude": replier.online, "elevenlabs": False,
+        "tts": None, "stt": None, "mic": False, "speaker": False, "notes": [],
+        "eyes": eyes.HAVE_EYES and replier.can_see,
+    }
     if not settings.voice_enabled:
         caps["notes"].append("voice disabled (BOOGEYMAN_VOICE=0)")
         return caps
-    if settings.elevenlabs_key:
-        from elevenlabs import TTS_RATE, ElevenLabs
+
+    from freevoice import TTS_RATE, EdgeTTS, FallbackSTT, FallbackTTS, GroqSTT, GroqTTS
+
+    want_tts, want_stt = settings.tts_provider, settings.stt_provider
+    el = None
+    if settings.elevenlabs_key and (want_tts in ("auto", "elevenlabs") or want_stt in ("auto", "elevenlabs")):
+        from elevenlabs import ElevenLabs
 
         el = ElevenLabs(
             settings.elevenlabs_key,
@@ -458,20 +602,58 @@ def setup_voice() -> dict[str, Any]:
             settings.stt_model,
             devil_voice_id=settings.devil_voice_id,
         )
-        el.devil = state["devil"]
-        state["tts"] = el  # so set_devil() can darken the voice
-        voice.transcribe = el.transcribe
-        voice.tts = el.speak
         caps["elevenlabs"] = True
-        try:
-            from audio import Speaker
 
-            voice.speaker = Speaker(TTS_RATE)
-            caps["speaker"] = True
-        except Exception as e:
-            caps["notes"].append(f"no speaker: {e}")
+    def note(why: str) -> None:
+        caps["notes"].append(f"switched to the free voice stack: {why[:90]}")
+
+    # ── his voice ──
+    # Edge is the free default. Orpheus was tried as the quicker option and measured slower
+    # overall - it starts ~600ms sooner but talks 1.43s longer on the same line, and its speed
+    # parameter is silently ignored, so that cannot be tuned out. See GroqTTS for the numbers.
+    # It stays available for anyone who prefers the voice: BOOGEYMAN_TTS=groq.
+    edge = EdgeTTS()
+    free: Any = GroqTTS(settings.groq_key) if (settings.groq_key and want_tts == "groq") else edge
+    if want_tts == "elevenlabs" and el:
+        tts: Any = el
+    elif want_tts in ("edge", "groq") or el is None:
+        tts = edge if want_tts == "edge" else free
+        if want_tts == "auto":
+            caps["notes"].append("no ELEVENLABS_API_KEY: using the free voice")
     else:
-        caps["notes"].append("ELEVENLABS_API_KEY not set: no voice")
+        tts = FallbackTTS(el, free, on_switch=note)
+    tts.devil = state["devil"]
+    state["tts"] = tts  # so set_devil() can darken whichever voice is live
+    state["edge"] = edge  # the standby, if Orpheus turns out to be locked
+    voice.tts = tts.speak
+    voice.tts_obj = tts  # lets him synthesize a clause at a time, and talk while still thinking
+    caps["tts"] = getattr(tts, "label", "elevenlabs")
+
+    # ── his ears ──
+    groq_stt = GroqSTT(settings.groq_key) if settings.groq_key else None
+    if want_stt == "elevenlabs" and el:
+        voice.transcribe, caps["stt"] = el.transcribe, "elevenlabs"
+    elif want_stt == "groq" and groq_stt:
+        voice.transcribe, caps["stt"] = groq_stt.transcribe, f"groq:{groq_stt.model}"
+    elif el and groq_stt:
+        ears = FallbackSTT(el, groq_stt, on_switch=note)
+        state["ears"] = ears  # settle_voice() promotes the backup if the key turns out to be dead
+        voice.transcribe, caps["stt"] = ears.transcribe, "elevenlabs (free fallback ready)"
+    elif el:
+        voice.transcribe, caps["stt"] = el.transcribe, "elevenlabs"
+    elif groq_stt:
+        voice.transcribe, caps["stt"] = groq_stt.transcribe, f"groq:{groq_stt.model}"
+    else:
+        caps["notes"].append("no speech-to-text: set GROQ_API_KEY or ELEVENLABS_API_KEY")
+
+    try:
+        from audio import Speaker
+
+        voice.speaker = Speaker(TTS_RATE)
+        caps["speaker"] = True
+    except Exception as e:
+        caps["notes"].append(f"no speaker: {e}")
+    log.info("voice: %s | ears: %s", caps["tts"], caps["stt"])
     try:
         from audio import Mic
 
@@ -486,13 +668,73 @@ def setup_voice() -> dict[str, Any]:
     return caps
 
 
+async def settle_voice() -> None:
+    """Work out which voices actually function, before the first turn rather than during it.
+
+    Two answers are needed, and both cost a round trip to discover the hard way:
+
+      - Orpheus is only usable once the model's terms are accepted in the Groq console. Until
+        then every request is a 400. It may be sitting there as the *backup* voice, and a backup
+        that doesn't work is worse than no backup at all - he just goes silent.
+      - ElevenLabs runs out of credits. Finding that out mid-sentence means the first turn of
+        every session is spent discovering it, and the live streaming path can't be used until
+        the switch has happened.
+
+    Settling both here means the voice he starts the session with is one that works.
+    """
+    caps, tts, edge = state["capabilities"], state["tts"], state["edge"]
+    if tts is None:
+        return
+
+    checked: dict[int, bool] = {}
+
+    async def works(v: Any) -> bool:
+        """Can this provider actually be used? Asked once per object, then remembered."""
+        if not hasattr(v, "available"):
+            return True
+        if id(v) not in checked:
+            checked[id(v)] = await v.available()
+        return checked[id(v)]
+
+    if hasattr(tts, "backup"):  # FallbackTTS: both ends have to be sound
+        if not await works(tts.backup):
+            caps["notes"].append(ORPHEUS_NOTE)
+            tts.backup = edge
+        if not await works(tts.primary):
+            # Dead primary: promote the backup now and skip the wasted first attempt.
+            caps["notes"].append("ElevenLabs can't be used: switched to the free voice.")
+            state["tts"] = tts = tts.backup
+            voice.tts, voice.tts_obj = tts.speak, tts
+    elif not await works(tts):
+        caps["notes"].append(ORPHEUS_NOTE)
+        state["tts"] = tts = edge
+        voice.tts, voice.tts_obj = edge.speak, edge
+
+    tts.devil = state["devil"]
+    caps["tts"] = getattr(tts, "label", caps["tts"])
+
+    # The ears get the same treatment: no point spending the first thing the boss says on
+    # discovering the key is dead. `works` has already asked, so this costs nothing.
+    ears = state.get("ears")
+    if ears is not None and not await works(ears.primary):
+        voice.transcribe = ears.backup.transcribe
+        caps["stt"] = f"groq:{getattr(ears.backup, 'model', 'whisper')}"
+
+    log.info("voice ready: %s | ears: %s", caps["tts"], caps["stt"])
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     state["capabilities"] = setup_voice()
+    await settle_voice()
     for note in state["capabilities"]["notes"]:
         log.warning(note)
+    if not state["capabilities"].get("eyes"):
+        why = "mss/pillow aren't installed" if not eyes.HAVE_EYES else "this brain can't see images"
+        log.warning("no eyes: %s, so study mode and look_at_screen are off", why)
     spawn(voice.run())
     yield
+    await study.stop()
     for t in list(tasks):
         t.cancel()
 

@@ -13,12 +13,13 @@ The model can call tools (remember / forget) in a short loop before answering.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
 import logging
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,32 @@ HERE = Path(__file__).parent
 FALLBACK_GREETINGS = ["Hello, boss.", "I'm here, boss.", "Hey, boss. I'm listening."]
 GROQ_URL = "https://api.groq.com/openai/v1"
 MAX_TOOL_ROUNDS = 4
+# He was answering "how far boss" with 210 characters: eleven seconds of talking at a man who
+# asked how his day was. persona.md already asks for 1-3 sentences and he drifts off it anyway,
+# so this goes last in the system prompt, where recency does the arguing.
+BREVITY = (
+    "## Length (this matters most)\n"
+    "He is listening, not reading. Every extra sentence is time he spends waiting on you.\n"
+    "- Answer in one or two short sentences, then stop.\n"
+    "- Don't restate his question, don't narrate what you're about to do, don't list your own\n"
+    "  abilities, and don't end by offering more help. He'll ask.\n"
+    "- Go long only when he actually asks for something long."
+)
+# Enough for the two sentences asked for above, with room to finish a thought. It is a backstop
+# against a runaway monologue, not the real limit: that's BREVITY.
+VOICE_TOKENS = 400
+# A screen answer is a verdict plus one line of why, so it needs less room than a chat reply.
+VISION_TOKENS = int(os.environ.get("BOOGEYMAN_VISION_TOKENS", "200"))
+# Groq's text models are blind, so a look can't ride the GROQ_FALLBACKS chain.
+GROQ_VISION = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# Claude thinks before it answers unless told otherwise, and on a voice turn that is pure delay.
+# Measured on "how far boss": 146 output tokens of deliberation to produce 55 characters of
+# "doing fine, ready when you are", and 748 ms of silence before the first word - half the wait
+# on a short turn. Chatting doesn't need it, and turning it off also retires the "invalid
+# signature in thinking block" failure that used to kill a turn mid-tool-call. The research
+# agent keeps its own call, and its reasoning, untouched. BOOGEYMAN_THINK=1 puts it back.
+THINK = os.environ.get("BOOGEYMAN_THINK", "0").lower() not in ("0", "off", "false", "no")
+NO_THINKING: dict[str, Any] = {} if THINK else {"thinking": {"type": "disabled"}}
 HISTORY_TO_LLM = int(os.environ.get("BOOGEYMAN_HISTORY", "12"))  # messages of recent chat sent with each turn
 # Groq's free tier limits each model separately (per minute and per day). When one is used up,
 # he moves on to the next instead of going quiet.
@@ -150,11 +177,15 @@ class Replier:
             return [self.model]
         return [self.model] + [m for m in GROQ_FALLBACKS if m != self.model]
 
-    async def _chat(self, body: dict[str, Any]) -> dict[str, Any]:
-        """POST a chat completion, falling back to the next free model when one is rate-limited."""
+    async def _chat(self, body: dict[str, Any], chain: list[str] | None = None) -> dict[str, Any]:
+        """POST a chat completion, falling back to the next free model when one is rate-limited.
+
+        `chain` overrides the usual fallback order, which a look has to do: the free text models
+        in GROQ_FALLBACKS cannot see an image and would answer about nothing.
+        """
         now = time.monotonic()
         waits: list[float] = []
-        for model in self._chain():
+        for model in (chain or self._chain()):
             until = self._cooldown.get(model, 0)
             if until > now:
                 waits.append(until - now)
@@ -176,30 +207,55 @@ class Replier:
             return r.json()
         raise AllLimited(min(waits) if waits else 60.0)
 
-    def system_prompt(self) -> str:
-        parts = [load_text("persona.md") or "You are the Boogeyman, the boss's personal AI. Speak briefly."]
+    def system_parts(self) -> tuple[str, str]:
+        """The system prompt in two halves: (stable, volatile).
+
+        The stable half - the persona and the boss's own notes - is byte-identical from one turn
+        to the next, so Anthropic can cache it instead of re-reading a couple of thousand tokens
+        before every single answer. Everything that changes turn to turn goes in the volatile
+        half, which sits after the cache breakpoint: saved facts, the clock, and the mode.
+        """
+        stable = [load_text("persona.md") or "You are the Boogeyman, the boss's personal AI. Speak briefly."]
         boss = load_text("boss.md")
         if boss:
-            parts.append("## The boss (his own words)\n" + boss)
+            stable.append("## The boss (his own words)\n" + boss)
         facts = self.memory.facts
-        parts.append(
+        volatile = [
             "## What you know about the boss\n"
             + ("\n".join(f"- {f['text']} (id {f['id']})" for f in facts) if facts else "- Nothing yet.")
-        )
+        ]
         local = datetime.now().astimezone()
-        parts.append(f"## Now\n{local.strftime('%A %d %B %Y, %H:%M')} ({local.tzname()})")
+        volatile.append(f"## Now\n{local.strftime('%A %d %B %Y, %H:%M')} ({local.tzname()})")
         if self.devil:
-            # Last, so it colours everything above it. A tone shift only: devil.md restates
-            # that every limit from the normal persona still applies.
-            parts.append(load_text("devil.md") or "Devil mode: answer in one cold, flat sentence. Same limits as always.")
-        return "\n\n".join(parts)
+            # A tone shift only: devil.md restates that every limit from the normal persona
+            # still applies.
+            volatile.append(load_text("devil.md") or "Devil mode: answer in one cold, flat sentence. Same limits as always.")
+        volatile.append(BREVITY)  # last, because this is the one he keeps forgetting
+        return "\n\n".join(stable), "\n\n".join(volatile)
 
-    async def reply(self, text: str) -> str:
-        if not self.online:
-            return fallback(text)
-        try:
-            out = await (self._anthropic(text) if self.anthropic else self._openai_compatible(text))
-        except AllLimited as e:
+    def system_prompt(self) -> str:
+        stable, volatile = self.system_parts()
+        return f"{stable}\n\n{volatile}"
+
+    def system_blocks(self) -> list[dict[str, Any]]:
+        """The same prompt, with a cache breakpoint after the stable half.
+
+        The breakpoint covers the tool schemas too: they sit ahead of the system prompt in the
+        cached prefix, and there are a dozen of them now that he has hands.
+        """
+        stable, volatile = self.system_parts()
+        return [
+            {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": volatile},
+        ]
+
+    def _explain(self, e: Exception) -> str:
+        """What he says out loud when a brain call fails. The detail goes to the log.
+
+        Checked most specific first: APIStatusError is an AnthropicError, and
+        httpx.HTTPStatusError is an httpx.HTTPError.
+        """
+        if isinstance(e, AllLimited):
             mins = max(1, round(e.wait / 60))
             log.warning("every model is rate-limited; shortest wait %.0fs", e.wait)
             return (
@@ -207,7 +263,7 @@ class Replier:
                 if mins < 60
                 else "I've used up today's free limit, boss. It resets later today."
             )
-        except httpx.HTTPStatusError as e:
+        if isinstance(e, httpx.HTTPStatusError):
             code = e.response.status_code
             log.warning("%s error %s: %s", self.provider, code, e.response.text[:300])
             if code in (401, 403):
@@ -215,7 +271,7 @@ class Replier:
             if code == 429:
                 return "I've hit my free limit for now, boss. Give me a minute."
             return f"My brain returned an error, {code}. Try again in a moment."
-        except APIStatusError as e:  # Anthropic answered, but with an error status
+        if APIStatusError and isinstance(e, APIStatusError):  # Anthropic answered with an error status
             code = e.status_code
             log.warning("anthropic error %s: %s", code, str(e)[:300])
             if code in (401, 403):
@@ -223,20 +279,63 @@ class Replier:
             if code == 429:
                 return "I've hit my rate limit for now, boss. Give me a minute."
             return f"My brain returned an error, {code}. Try again in a moment."
-        except AnthropicError as e:  # couldn't reach Anthropic at all (connect/read/timeout)
+        if AnthropicError and isinstance(e, AnthropicError):  # couldn't reach Anthropic at all
             log.warning("anthropic unreachable: %s", e)
             return "I can't reach my brain right now, boss. Check the internet."
-        except httpx.HTTPError as e:
+        if isinstance(e, httpx.HTTPError):
             log.warning("%s unreachable: %s", self.provider, e)
             return "I can't reach my brain right now, boss. Check the internet."
-        except Exception:
-            # Last resort. Anything unexpected here used to escape into the voice loop and leave
-            # him silent for the turn; the traceback still goes to the terminal, but he answers.
-            log.exception("reply failed unexpectedly")
-            return "Something broke on my side, boss. Say that again."
+        # Last resort. Anything unexpected here used to escape into the voice loop and leave him
+        # silent for the turn; the traceback still goes to the terminal, but he answers.
+        log.error("reply failed unexpectedly", exc_info=e)
+        return "Something broke on my side, boss. Say that again."
+
+    async def reply(self, text: str) -> str:
+        if not self.online:
+            return fallback(text)
+        try:
+            out = await (self._anthropic(text) if self.anthropic else self._openai_compatible(text))
+        except Exception as e:
+            return self._explain(e)
         out = out.strip() or "Done, boss."
         self.memory.add_turn(text, out)
         return out
+
+    async def reply_stream(self, text: str) -> AsyncIterator[str]:
+        """reply(), but handed over in pieces so the voice can start on the first clause.
+
+        Waiting for the whole answer before synthesizing any of it cost about a second and a half
+        of silence every turn: the brain's last token and the voice's first request were strictly
+        sequential. Now they overlap.
+        """
+        if not self.online:
+            out = fallback(text)
+            yield out
+            self.memory.add_turn(text, out)
+            return
+        out = ""
+        try:
+            if self.anthropic:
+                async for piece in self._anthropic_stream(text):
+                    out += piece
+                    yield piece
+            else:
+                # The OpenAI-compatible path goes through _chat(), which carries the Groq
+                # per-model fallback and cooldowns. Not worth forking that for streaming, so he
+                # gets the answer in one piece here, exactly as he did before.
+                out = await self._openai_compatible(text)
+                yield out
+        except Exception as e:
+            msg = self._explain(e)
+            if out.strip():
+                # He is already mid-sentence. Tacking an error onto half an answer sounds worse
+                # than just stopping, and the log keeps the detail either way.
+                log.warning("reply stream broke after %d characters: %s", len(out), e)
+            else:
+                out = msg
+                yield msg
+        out = out.strip() or "Done, boss."
+        self.memory.add_turn(text, out)
 
     # ── tools ──
     def add_tool(self, schema: dict[str, Any], handler: Callable[[dict[str, Any]], Awaitable[str]]) -> None:
@@ -287,6 +386,54 @@ class Replier:
         data = await self._chat(body)
         return str(data["choices"][0]["message"].get("content") or "")
 
+    @property
+    def can_see(self) -> bool:
+        """Is there a model behind this provider that can take an image?"""
+        return bool(self.anthropic) or self.provider in ("groq", "openai")
+
+    async def look(self, system: str, prompt: str, img: bytes, media: str = "image/jpeg") -> str:
+        """One look at an image: no tools, no history, no memory of it afterwards.
+
+        Deliberately stateless. A screen is read dozens of times in a study session and none of
+        those frames belong in the conversation the boss can hear played back to him.
+        """
+        b64 = base64.b64encode(img).decode()
+        if self.anthropic:
+            msg = await self.anthropic.messages.create(
+                model=self.model,
+                max_tokens=VISION_TOKENS,
+                system=system,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": media, "data": b64}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                **NO_THINKING,
+            )
+            return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        model = GROQ_VISION if self.provider == "groq" else self.model
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{media};base64,{b64}"}},
+                    ],
+                },
+            ],
+            "max_tokens": VISION_TOKENS,
+            "temperature": 0.2,
+        }
+        data = await self._chat(body, chain=[model])
+        return str(data["choices"][0]["message"].get("content") or "").strip()
+
     # ── OpenAI-compatible (Groq, Gemini, OpenRouter...) ──
     async def _openai_compatible(self, text: str) -> str:
         messages: list[dict[str, Any]] = [
@@ -299,7 +446,7 @@ class Replier:
             body: dict[str, Any] = {
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": 700,
+                "max_tokens": VOICE_TOKENS,
                 "temperature": 0.7,
                 "tools": tools,
                 "tool_choice": "auto",
@@ -327,10 +474,10 @@ class Replier:
         # down to the minute, and the signature on a thinking block is bound to the conversation
         # prefix: if a tool runs across a minute boundary, a rebuilt prompt invalidates it and the
         # whole turn comes back as a 400.
-        system = self.system_prompt()
+        system = self.system_blocks()
         for _ in range(MAX_TOOL_ROUNDS):
             msg = await self.anthropic.messages.create(  # type: ignore[union-attr]
-                model=self.model, max_tokens=700, system=system, messages=messages, tools=tools
+                model=self.model, max_tokens=VOICE_TOKENS, system=system, messages=messages, tools=tools, **NO_THINKING
             )
             uses = [b for b in msg.content if getattr(b, "type", "") == "tool_use"]
             if not uses:
@@ -343,6 +490,34 @@ class Replier:
                 )
             messages.append({"role": "user", "content": results})
         return "Done, boss."
+
+    async def _anthropic_stream(self, text: str) -> AsyncIterator[str]:
+        """_anthropic(), yielding text as it is generated.
+
+        Text that arrives before a tool call is yielded too, rather than held back: hearing
+        "let me check that" while a search runs beats hearing nothing at all.
+        """
+        messages: list[dict[str, Any]] = [*self.history, {"role": "user", "content": text}]
+        tools = [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in self.tools]
+        system = self.system_blocks()  # once per turn, for the reason given in _anthropic()
+        for _ in range(MAX_TOOL_ROUNDS):
+            async with self.anthropic.messages.stream(  # type: ignore[union-attr]
+                model=self.model, max_tokens=VOICE_TOKENS, system=system, messages=messages, tools=tools, **NO_THINKING
+            ) as stream:
+                async for ev in stream:
+                    if ev.type == "content_block_delta" and getattr(ev.delta, "type", "") == "text_delta":
+                        yield ev.delta.text
+                msg = await stream.get_final_message()
+            uses = [b for b in msg.content if getattr(b, "type", "") == "tool_use"]
+            if not uses:
+                return
+            messages.append({"role": "assistant", "content": [b.model_dump() for b in msg.content]})
+            results = []
+            for u in uses:
+                results.append(
+                    {"type": "tool_result", "tool_use_id": u.id, "content": await self.run_tool(u.name, dict(u.input))}
+                )
+            messages.append({"role": "user", "content": results})
 
 
 def resolve_provider(provider: str, anthropic_key: str | None, groq_key: str | None, openai_key: str | None) -> str:

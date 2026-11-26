@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 
 import httpx
 
 from reply import CONNECT_RETRIES, CONNECT_TIMEOUT, KEEPALIVE_S
 
+log = logging.getLogger("brain.elevenlabs")
 API = "https://api.elevenlabs.io"
 TTS_RATE = 24000  # Hz, matches output_format below
 TTS_FORMAT = f"pcm_{TTS_RATE}"  # raw 16-bit little-endian mono
@@ -44,6 +46,31 @@ class ElevenLabs:
             ),
         )
         self.headers = {"xi-api-key": api_key}
+
+    async def available(self) -> bool:
+        """Has this key got any credits left, and the permissions to spend them?
+
+        Asked once at boot, because the alternative is finding out mid-sentence: the first turn
+        of every session would spend a round trip discovering the quota is gone, and only then
+        start again on the free voice. This endpoint costs nothing and answers definitively.
+        """
+        try:
+            r = await self.http.get(f"{API}/v1/user/subscription", headers=self.headers)
+            if r.status_code in (401, 403):
+                log.warning("ElevenLabs rejected the key (%s)", r.status_code)
+                return False
+            r.raise_for_status()
+            d = r.json()
+            used, limit = int(d.get("character_count", 0)), int(d.get("character_limit", 0))
+            if limit and used >= limit:
+                log.warning("ElevenLabs quota is spent (%d/%d characters)", used, limit)
+                return False
+            log.info("ElevenLabs has %d of %d characters left", max(0, limit - used), limit)
+            return True
+        except Exception as e:
+            # A blip here shouldn't condemn a working key; the per-turn fallback still covers it.
+            log.info("couldn't check the ElevenLabs quota (%s); trying it anyway", str(e)[:120])
+            return True
 
     async def transcribe(self, wav: bytes) -> str:
         r = await self.http.post(

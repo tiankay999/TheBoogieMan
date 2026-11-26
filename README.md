@@ -1,6 +1,6 @@
 # The Boogeyman
 
-A personal, voice-first desktop AI assistant for Linux, in the spirit of Jarvis. You talk, he answers out loud, with a bit of Ghanaian Pidgin. He remembers you, researches the web live on screen, and runs his own UI by voice: work mode, devil mode, backgrounds, shutdown.
+A personal, voice-first desktop AI assistant for Linux, in the spirit of Jarvis. You talk, he answers out loud, with a bit of Ghanaian Pidgin. He remembers you, researches the web live on screen, reads your screen when you ask, and runs his own UI by voice: work mode, devil mode, backgrounds, shutdown.
 
 > "Welcome back, boss. I'm listening."
 
@@ -167,6 +167,15 @@ Say **"What can you do?"** at any time to see this on screen.
 - "Research …" / "look up …" / "search for …": live web research in the workspace, with cards for queries, sources, findings and progress. Then he reads you the summary.
 - "Back to the normal screen" / "exit work mode" / "go home": closes the workspace.
 
+**Eyes**
+- "What's on my screen?" / "What does this error say?": he takes a look and tells you. He
+  reaches for this himself whenever a question is about something in front of you.
+- "Study mode" / "watch my screen": he goes quiet and watches. When there's a question on
+  screen he gives the answer and one short line of why, then does the same for the next one.
+  He says nothing at all when there's no question in front of him.
+- "Further more": opens up the last answer properly - why it's right, why the others aren't.
+- "Stop studying" / "exit study mode": he stops watching.
+
 **Screen**
 - "Change the background" / "sea background" / "nebula" / "background off" / "background on".
 - "Devil mode" / "go devil" / "unleash": the visor drops, everything goes red and the eye opens. "Stand down" / "exit devil mode" ends it.
@@ -175,7 +184,7 @@ Say **"What can you do?"** at any time to see this on screen.
 - "Shut down": he asks first. Say "yes" to confirm or "no" to keep him.
 - "Shut down now": closes immediately.
 
-The phrases above are instant commands and work even without a brain key. The AI also has each action as a **tool** (`shutdown`, `switch_screen`, `set_background`, `devil_mode`, `show_commands`, `clear_conversation`, `research`), so free phrasing works too, e.g. "abeg close yourself" or "take me back home".
+The phrases above are instant commands and work even without a brain key. The AI also has each action as a **tool** (`shutdown`, `switch_screen`, `set_background`, `devil_mode`, `show_commands`, `clear_conversation`, `research`, `look_at_screen`), so free phrasing works too, e.g. "abeg close yourself" or "take me back home".
 
 ---
 
@@ -214,7 +223,7 @@ Three languages, one app:
 |-------|--------|----------|-----|
 | Face | `app/src` | React + TypeScript + three.js | The HUD: core, curved screens, workspace, devil mode |
 | Body | `app/src-tauri` | Rust (Tauri v2) | Window, OS integration, starts and talks to the brain |
-| Brain | `brain/` | Python (FastAPI) | Voice loop, AI, memory, commands, research |
+| Brain | `brain/` | Python (FastAPI) | Voice loop, AI, memory, commands, research, eyes |
 
 ```
 React --invoke--> Rust --WebSocket--> Python
